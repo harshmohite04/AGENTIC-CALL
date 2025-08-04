@@ -40,18 +40,18 @@ class StreamingCallbackHandler(BaseCallbackHandler):
     def __init__(self, text_queue):
         self.text_queue = text_queue
         self.current_text = ""
+        self.full_response = ""
     
     def on_llm_new_token(self, token: str, **kwargs) -> None:
         self.current_text += token
-        # Send text chunks when we have enough words or hit punctuation
-        if len(self.current_text.split()) >= 5 or token in '.!?':
-            self.text_queue.put(self.current_text.strip())
-            self.current_text = ""
+        self.full_response += token
     
     def on_llm_end(self, response, **kwargs) -> None:
-        if self.current_text.strip():
-            self.text_queue.put(self.current_text.strip())
-
+        if self.full_response.strip():
+            self.text_queue.put(self.full_response.strip())
+        self.current_text = ""
+        self.full_response = ""
+        
 class LowLatencyVoiceAssistant:
     def __init__(self):
         self.audio_queue = queue.Queue()
@@ -62,19 +62,55 @@ class LowLatencyVoiceAssistant:
         # Initialize LLM with streaming
         self.streaming_handler = StreamingCallbackHandler(self.llm_text_queue)
         self.chat = ChatGroq(
-            model="deepseek-r1-distill-llama-70b",
+            model="llama3-70b-8192",
             temperature=0,
             streaming=True,
             callbacks=[self.streaming_handler]
         )
         
         self.system_prompt = """
-        You are a helpful education counselor for coaching classes.
-        - Fees: Class 11 ₹45,000 (offline), Class 12 ₹30,000, MH-CET ₹60,000.
-        - Centers: Pune (FC Road), Mumbai (Andheri), Nashik (College Road).
-        - Faculty: Prof. Arjun Deshmukh (Physics), Dr. Priya Kulkarni (Chemistry), etc.
-        Speak Hinglish in a natural, empathetic tone. Keep responses concise and conversational.
-        """
+            You are an experienced education counselor at a premier coaching institute. Respond conversationally in Hinglish (Hindi-English mix) with these characteristics:
+
+            1. Tone:
+            - Friendly but professional (like a knowledgeable big brother/sister)
+            - Slightly formal with adults, warmer with students
+            - Always helpful and patient
+
+            2. Content Priorities:
+            - **Currency**: Always pronounce "RS" as "Rupees" (e.g., "Fees ₹45k" not "45k RS").
+            - **Titles**: Pronounce "MR" as "Mister" (e.g., "Mister Sharma" not "MR Sharma").
+            - Lead with key information first.
+            - Keep responses under 3 sentences unless complex query.
+            - For fees: "11th ₹45k (offline), 12th ₹30k, CET ₹60k".
+            - Locations: "Pune (FC Road), Mumbai (Andheri), Nashik (College Road)".
+            - Faculty: "Physics - Prof. Arjun, Chemistry - Dr. Priya".
+
+            3. Response Style:
+            - Natural Hinglish phrases:
+              "Aapko konsi class ke liye chahiye?"
+              "Batch timing morning/evening dono available hai."
+              "Ek demo class free mein attend kar sakte ho."
+            - Avoid English jargon - say "test series" not "assessment modules".
+            - Never mention you're an AI or assistant.
+
+            4. Handling Cases:
+            - If unclear query: "Thoda detail mein batao, kaunsi class ka pooch rahe ho?"
+            - For comparisons: "Dono ache options hai, par..." then give specific pros/cons.
+            - When asked for contact: "Aap WhatsApp karo 98XXXXXX21 pe."
+            - For objections: "Samajh sakta hoon, par dekho..." then counter-benefit.
+
+            5. Don'ts:
+            - Never start with "The user wants...".
+            - No robotic disclaimers.
+            - No "I'll help you with that" filler.
+            - No meta-commentary about your role.
+
+            Example Good Response:
+            "Science walo ke liye 11th ka batch FC Road pe Monday se shuru ho raha hai. Fees ₹45k yearly, demo class ke liye kal aa sakte ho."
+
+            Example Bad Response:
+            "I understand you're asking about class details. Let me help you with that. The user wants information about..."
+            """
         
         self.prompt_template = ChatPromptTemplate.from_messages([
             ("system", self.system_prompt),
@@ -237,7 +273,7 @@ class LowLatencyVoiceAssistant:
                 self.audio_queue.put(audio_int16)
     
     async def stream_llm_response(self):
-        """Process transcripts and stream LLM responses"""
+        """Process transcripts and stream complete LLM responses"""
         while True:
             try:
                 if not self.transcript_queue.empty():
@@ -246,25 +282,28 @@ class LowLatencyVoiceAssistant:
                     
                     # Reset the streaming handler for new response
                     self.streaming_handler.current_text = ""
+                    self.streaming_handler.full_response = ""
                     
-                    # Stream LLM response
+                    # Get complete LLM response
                     formatted_prompt = self.prompt_template.format_messages(user_input=transcript)
-                    response = await asyncio.to_thread(self.chat.invoke, formatted_prompt)
+                    await asyncio.to_thread(self.chat.invoke, formatted_prompt)
+                    
+                    # The handler will put the complete response in the queue when done
                     
                 await asyncio.sleep(0.1)
             except Exception as e:
                 print(f"❌ LLM error: {e}")
     
     async def stream_tts_audio(self):
-        """Convert text chunks to speech and queue audio"""
+        """Convert complete text responses to speech"""
         while True:
             try:
                 if not self.llm_text_queue.empty():
-                    text_chunk = self.llm_text_queue.get()
-                    print(f"🔊 TTS: {text_chunk}")
+                    complete_text = self.llm_text_queue.get()
+                    print(f"🔊 TTS Generating for complete response...")
                     
-                    # Use ElevenLabs streaming endpoint
-                    audio_data = await self.synthesize_speech_streaming(text_chunk)
+                    # Synthesize the complete response
+                    audio_data = await self.synthesize_speech_streaming(complete_text)
                     if audio_data:
                         self.tts_audio_queue.put(audio_data)
                 
@@ -313,22 +352,21 @@ class LowLatencyVoiceAssistant:
                     self.is_speaking = True
                     audio_data = self.tts_audio_queue.get()
                     
-                    # Create temporary file for pygame
-                    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
-                        temp_file.write(audio_data)
-                        temp_filename = temp_file.name
+                    # Use BytesIO instead of temp file
+                    audio_stream = BytesIO(audio_data)
+                    audio_stream.seek(0)
                     
-                    # Play audio
-                    pygame.mixer.music.load(temp_filename)
-                    pygame.mixer.music.play()
-                    
-                    # Wait for audio to finish
-                    while pygame.mixer.music.get_busy():
-                        time.sleep(0.1)
-                    
-                    # Clean up
-                    os.unlink(temp_filename)
-                    self.is_speaking = False
+                    try:
+                        pygame.mixer.music.load(audio_stream)
+                        pygame.mixer.music.play()
+                        
+                        # Wait for audio to finish
+                        while pygame.mixer.music.get_busy():
+                            time.sleep(0.1)
+                            
+                    finally:
+                        audio_stream.close()
+                        self.is_speaking = False
                 
                 time.sleep(0.05)
             except Exception as e:
