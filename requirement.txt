@@ -1,0 +1,9 @@
+dotenv
+deepgram-sdk==2.12.0
+requests
+playsound==1.2.2
+langchain_groq
+langchain
+pydub
+sounddevice
+numpy
