@@ -1,36 +1,36 @@
-# Use Python base image with platform compatibility
-FROM --platform=linux/amd64 python:3.11-slim
+# Use an AMD64 Python base image
+FROM --platform=linux/amd64 python:3.10-slim
 
-# Set environment vars
-ENV PYTHONUNBUFFERED=1 \
-    SDL_AUDIODRIVER=dsp \
-    SDL_VIDEODRIVER=dummy
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Install system dependencies for audio and pygame
+# Install OS dependencies
 RUN apt-get update && apt-get install -y \
-    libasound2-dev \
-    libportaudio2 \
-    libsndfile1 \
     ffmpeg \
-    libsdl2-mixer-2.0-0 \
-    libsdl2-2.0-0 \
+    libasound2-dev \
+    portaudio19-dev \
+    libffi-dev \
+    libsndfile1 \
     build-essential \
+    git \
+    curl \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Set workdir
+# Set working directory
 WORKDIR /app
 
-# Copy project files
+# Copy and install dependencies
+COPY requirementFinal.txt .
+RUN pip install --upgrade pip && pip install -r requirementFinal.txt
+
+# Copy your application code
 COPY . .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip 
-# && pip install --no-cache-dir -r requirements.txt
-#RUN pip install --no-cache-dir -r requirements.txt
+# Expose port for FastAPI if needed
+EXPOSE 8000
 
-# Expose port if needed (optional)
-# EXPOSE 8000
-
-# Run the assistant
-#CMD ["python", "app/main.py"]
-CMD ["python", "websocketV2.py"]
+# Default command — change 'main.py' to your actual entry point if different
+CMD ["python", "edgetts.py"]
