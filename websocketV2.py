@@ -24,7 +24,7 @@ load_dotenv()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = "your_default_voice_id"  # e.g., "21m00Tcm4TlvDq8ikWAM"
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")  # e.g., "21m00Tcm4TlvDq8ikWAM"
 
 if not ELEVENLABS_API_KEY:
     print("ELEVENLABS_API_KEY not found")
