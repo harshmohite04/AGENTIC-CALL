@@ -16,29 +16,40 @@ import time
 import traceback
 import collections
 import webrtcvad
-
-# TTS Options
-import pyttsx3
+import logging
+import aiohttp
 
 # Load environment variables
 load_dotenv()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = "your_default_voice_id"  # e.g., "21m00Tcm4TlvDq8ikWAM"
+
+if not ELEVENLABS_API_KEY:
+    print("ELEVENLABS_API_KEY not found")
+    exit(1)
 
 if not DEEPGRAM_API_KEY:
-    print("❌ DEEPGRAM_API_KEY not found")
+    print("DEEPGRAM_API_KEY not found")
     exit(1)
 if not GROQ_API_KEY:
-    print("❌ GROQ_API_KEY not found")
+    print("GROQ_API_KEY not found")
     exit(1)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
 # Audio settings
 SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_SIZE = 8000
-BUFFER_DURATION = 1.0
-FRAME_DURATION = 30
+FRAME_DURATION = 30  # ms
 FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION / 1000)
+BUFFER_DURATION = 1.0  # seconds
 MAX_BUFFER_FRAMES = int(BUFFER_DURATION * 1000 / FRAME_DURATION)
 
 # Initialize pygame mixer quietly
@@ -58,42 +69,41 @@ class StreamingCallbackHandler(BaseCallbackHandler):
         self.is_generating = True
         self.current_text = ""
         self.full_response = ""
-        print("🤖 LLM generation started...")
+        logging.info("🤖 LLM generation started...")
     
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-        # Check for interruption but don't stop - let it complete if almost done
         if self.assistant_ref.user_interrupted:
-            return  # Just ignore new tokens, don't add them
-        
+            return
         self.current_text += token
         self.full_response += token
     
     def on_llm_end(self, response, **kwargs) -> None:
         self.is_generating = False
         if self.full_response.strip() and not self.assistant_ref.user_interrupted:
-            print(f"✅ LLM response complete: {self.full_response[:50]}...")
+            logging.info(f"LLM response complete: {self.full_response[:50]}...")
             self.text_queue.put(self.full_response.strip())
         else:
-            print("❌ LLM response cancelled due to interruption")
+            logging.info("LLM response cancelled due to interruption")
         self.current_text = ""
         self.full_response = ""
 
 class FreeTTSVoiceAssistant:
-    def __init__(self, tts_method="pyttsx3"):
+    def __init__(self):
         self.audio_queue = queue.Queue()
         self.transcript_queue = queue.Queue()
         self.llm_text_queue = queue.Queue()
-        self.tts_method = tts_method
         
         # Context management
         self.context_stack = collections.deque(maxlen=3)
         
         # VAD setup
-        self.vad = webrtcvad.Vad(2)
+        self.vad = webrtcvad.Vad(3) # Less sensitive than 2 or 3
+        self.silence_threshold = 20  # Increased silence threshold
         self.audio_buffer = collections.deque(maxlen=MAX_BUFFER_FRAMES)
         self.is_speech_detected = False
         self.silence_frames = 0
         self.speech_frames = 0
+        self.consecutive_speech_threshold = 3  # Require more consecutive speech
         
         # Control flags
         self.is_listening = True
@@ -105,8 +115,8 @@ class FreeTTSVoiceAssistant:
         
         # Add interrupt event for immediate stopping
         self.interrupt_event = asyncio.Event()
+        self.tts_lock = asyncio.Lock()  # Lock for TTS operations
         
-        self.init_tts_engine()
         self.streaming_handler = StreamingCallbackHandler(self.llm_text_queue, self)
         
         self.chat = ChatGroq(
@@ -117,34 +127,15 @@ class FreeTTSVoiceAssistant:
             groq_api_key=GROQ_API_KEY
         )
         
-        self.system_prompt = """You are an experienced customer care agent for Vishwakarma Classes. Handle client queries about classes only. Be friendly and respond in Hinglish. Keep responses short (1-2 lines). Use full words instead of abbreviations (Mister instead of MR, Rupees instead of RS). Start with warm greetings."""
-            
+        self.system_prompt = """You are an experienced customer care agent for Vishwakarma Classes. Handle client queries about classes only. Be friendly and respond in Hinglish. Keep responses short (1-2 lines). Use full words instead of abbreviations (Mister instead of MR, Rupees instead of RS). Start with warm greetings initially, dont always say namaste as you said it first"""
+        
         self.prompt_template = ChatPromptTemplate.from_messages([
             ("system", self.system_prompt),
             ("human", "{conversation_context}\n\nCurrent question: {user_input}")
         ])
-        
-    def init_tts_engine(self):
-        try:
-            self.tts_engine = pyttsx3.init()
-            voices = self.tts_engine.getProperty('voices')
-            if voices:
-                for voice in voices:
-                    if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
-                        self.tts_engine.setProperty('voice', voice.id)
-                        break
-                else:
-                    self.tts_engine.setProperty('voice', voices[0].id)
-            
-            self.tts_engine.setProperty('rate', 180)
-            self.tts_engine.setProperty('volume', 0.9)
-            print("✅ TTS engine initialized")
-        except Exception as e:
-            print(f"❌ TTS init failed: {e}")
-            self.tts_engine = None
 
     def process_audio_frame(self, audio_data):
-        """Process audio frame with WebRTC VAD"""
+        """Process audio frame with WebRTC VAD and energy threshold"""
         try:
             # Convert to int16 if needed
             if audio_data.dtype == np.float32:
@@ -160,34 +151,29 @@ class FreeTTSVoiceAssistant:
             # Use only the required frame size
             vad_frame = frame_bytes[:2 * FRAME_SIZE]
             return self.vad.is_speech(vad_frame, SAMPLE_RATE)
-            
         except Exception:
             return False
 
     def handle_interruption(self):
-        """FIXED: Only stop current operations, don't stop processing pipeline"""
-        print("🛑 User speaking - interrupting current output")
+        """More graceful interruption handling"""
+        if not self.is_speaking and not self.streaming_handler.is_generating:
+            return
+        
+        logging.info("🛑 User speaking - interrupting current output")
         self.user_interrupted = True
         
-        # Stop TTS immediately
-        if self.is_speaking and self.tts_engine:
+        # Stop any ongoing TTS
+        if self.is_speaking:
             try:
-                self.tts_engine.stop()
-                print("🔇 TTS stopped")
-            except:
-                pass
+                pygame.mixer.music.stop()
+                logging.info("🔇 TTS stopped")
+            except Exception as e:
+                logging.error(f"❌ TTS stop error: {e}")
             finally:
                 self.is_speaking = False
         
-        # Cancel TTS task if running
-        if self.tts_task and not self.tts_task.done():
-            self.tts_task.cancel()
-            print("❌ TTS task cancelled")
-        
-        # Clear TTS queue (old responses), but keep transcript processing
+        # Clear queues more selectively
         self._clear_queue(self.llm_text_queue)
-        
-        # Set interrupt event
         self.interrupt_event.set()
 
     def _clear_queue(self, q):
@@ -199,54 +185,46 @@ class FreeTTSVoiceAssistant:
                 break
 
     def audio_callback(self, indata, frames, time_info, status):
-        """FIXED: Removed blocking time.sleep() and proper interruption"""
-        audio_flat = indata.flatten()
-        
-        # Always buffer audio for pre-roll
-        self.audio_buffer.append(audio_flat.copy())
-        
-        # Check for speech
-        is_speech = self.process_audio_frame(audio_flat)
-        
-        if is_speech:
-            if not self.is_speech_detected:
-                # Speech started - interrupt current operations if needed
-                if self.is_speaking or self.streaming_handler.is_generating:
-                    self.handle_interruption()
-                
-                # Speech started - send buffer
-                self.is_speech_detected = True
-                self.user_interrupted = False  # Reset for new input
+        """Robust audio processing with noise suppression"""
+        if not self.connection_active:
+            return
+            
+        try:
+            audio_flat = indata.flatten()
+            self.audio_buffer.append(audio_flat.copy())
+            
+            # More conservative speech detection
+            is_speech = self.process_audio_frame(audio_flat)
+            audio_int16 = (audio_flat * 32767).astype(np.int16) if audio_flat.dtype == np.float32 else audio_flat.astype(np.int16)
+            
+            if is_speech:
+                self.speech_frames += 1
                 self.silence_frames = 0
                 
-                print("🎤 New speech detected")
+                if not self.is_speech_detected and self.speech_frames > self.consecutive_speech_threshold:
+                    self.is_speech_detected = True
+                    self.user_interrupted = False
+                    logging.info("🎤 New speech detected")
+                    
+                    # Handle interruption if needed
+                    if self.is_speaking or self.streaming_handler.is_generating:
+                        self.handle_interruption()
+                    
+                    # Send buffer
+                    for buffered in self.audio_buffer:
+                        self.audio_queue.put(buffered)
                 
-                # Send pre-roll buffer
-                for buffered_audio in self.audio_buffer:
-                    if buffered_audio.dtype == np.float32:
-                        audio_int16 = (buffered_audio * 32767).astype(np.int16)
-                    else:
-                        audio_int16 = buffered_audio.astype(np.int16)
-                    self.audio_queue.put(audio_int16)
-            
-            # Continue sending current frame
-            if audio_flat.dtype == np.float32:
-                audio_int16 = (audio_flat * 32767).astype(np.int16)
-            else:
-                audio_int16 = audio_flat.astype(np.int16)
-            self.audio_queue.put(audio_int16)
-            
-            self.speech_frames += 1
-            self.silence_frames = 0  # Reset silence counter
-            
-        elif self.is_speech_detected:
-            # Potential end of speech
-            self.silence_frames += 1
-            if self.silence_frames > 8:  # End speech after several silent frames
-                print("🤫 Speech ended")
-                self.is_speech_detected = False
-                self.silence_frames = 0
-                self.speech_frames = 0
+                self.audio_queue.put(audio_int16)
+                
+            elif self.is_speech_detected:
+                self.silence_frames += 1
+                if self.silence_frames > self.silence_threshold:
+                    self.is_speech_detected = False
+                    self.speech_frames = 0
+                    logging.info("🤫 Speech ended")
+                    
+        except Exception as e:
+            logging.error(f"❌ Audio callback error: {e}")
 
     async def stream_deepgram_transcription(self):
         """Deepgram connection with better keepalive"""
@@ -264,7 +242,7 @@ class FreeTTSVoiceAssistant:
             "encoding": "linear16",
             "sample_rate": str(SAMPLE_RATE),
             "channels": str(CHANNELS),
-            "keep_alive": "true"  # Keep connection alive
+            "keep_alive": "true"
         }
                 
         param_string = "&".join([f"{k}={v}" for k, v in params.items()])
@@ -275,10 +253,10 @@ class FreeTTSVoiceAssistant:
         
         while self.connection_active and retry_count < max_retries:
             try:
-                print(f"🔄 Connecting to Deepgram... (attempt {retry_count + 1})")
+                logging.info(f"🔄 Connecting to Deepgram... (attempt {retry_count + 1})")
                 async with websockets.connect(full_uri, extra_headers=extra_headers, 
                                             ping_interval=20, ping_timeout=10) as websocket:
-                    print("✅ Connected to Deepgram")
+                    logging.info("✅ Connected to Deepgram")
                     retry_count = 0
                     
                     # Send keepalive periodically
@@ -306,7 +284,7 @@ class FreeTTSVoiceAssistant:
                             except queue.Empty:
                                 continue
                             except Exception as e:
-                                print(f"❌ Audio send error: {e}")
+                                logging.error(f"❌ Audio send error: {e}")
                                 break
                     
                     async def receive_transcripts():
@@ -331,13 +309,12 @@ class FreeTTSVoiceAssistant:
                                         is_final = data.get('is_final', False)
                                         
                                         if is_final and transcript and len(transcript) > 2:
-                                            print(f"🗣 Final: {transcript}")
-                                            # Always process new transcripts
+                                            logging.info(f"🗣 Final: {transcript}")
                                             self.transcript_queue.put(transcript)
                                         elif transcript:
                                             print(f"⏳ Interim: {transcript}", end='\r')
                         except Exception as e:
-                            print(f"❌ Transcript receive error: {e}")
+                            logging.error(f"❌ Transcript receive error: {e}")
                             return
                     
                     await asyncio.gather(
@@ -348,11 +325,11 @@ class FreeTTSVoiceAssistant:
                     
             except Exception as e:
                 retry_count += 1
-                print(f"❌ Connection error (attempt {retry_count}): {e}")
+                logging.error(f"❌ Connection error (attempt {retry_count}): {e}")
                 if retry_count < max_retries:
                     await asyncio.sleep(min(retry_count * 2, 10))
                 else:
-                    print("❌ Max retries reached, giving up")
+                    logging.error("❌ Max retries reached, giving up")
                     self.connection_active = False
 
     def build_conversation_context(self):
@@ -368,16 +345,14 @@ class FreeTTSVoiceAssistant:
         return "\n".join(context_parts)
 
     async def stream_llm_response(self):
-        """FIXED: Process all transcripts, handle interruptions properly"""
+        """Process all transcripts, handle interruptions properly"""
         while self.connection_active:
             try:
                 if not self.transcript_queue.empty():
                     transcript = self.transcript_queue.get()
                     
-                    # Don't check if already processing - handle all inputs
                     self.llm_processing = True
-                    
-                    print(f"🤖 Processing transcript: {transcript}")
+                    logging.info(f"🤖 Processing transcript: {transcript}")
                     
                     # Reset interruption flag for new input
                     self.user_interrupted = False
@@ -398,122 +373,190 @@ class FreeTTSVoiceAssistant:
                         # Run LLM in thread
                         response = await asyncio.to_thread(self.chat.invoke, formatted_prompt)
                         
-                        # Add to context if not interrupted and we got a response
+                        # Add to context if not interrupted
                         if not self.user_interrupted and self.streaming_handler.full_response.strip():
                             self.context_stack.append((transcript, self.streaming_handler.full_response.strip()))
-                            print(f"💾 Added to context: {len(self.context_stack)} conversations")
+                            logging.info(f"💾 Added to context: {len(self.context_stack)} conversations")
                         
                     except Exception as e:
-                        print(f"❌ LLM processing error: {e}")
+                        logging.error(f"❌ LLM processing error: {e}")
                     finally:
                         self.llm_processing = False
                 
                 await asyncio.sleep(0.05)
                 
             except Exception as e:
-                print(f"❌ LLM loop error: {e}")
+                logging.error(f"❌ LLM loop error: {e}")
                 self.llm_processing = False
                 await asyncio.sleep(1)
 
     async def stream_tts_audio(self):
-        """FIXED: Better TTS handling - always ready for new responses"""
+        """Convert complete text responses to speech"""
         while self.connection_active:
             try:
                 if not self.llm_text_queue.empty() and not self.is_speaking:
                     text = self.llm_text_queue.get()
                     
-                    # Skip if interrupted, but continue processing
                     if self.user_interrupted:
-                        print("🚫 TTS skipped due to interruption")
+                        logging.info("🚫 TTS skipped due to interruption")
                         continue
                     
-                    print(f"🔊 Starting TTS: {text[:50]}...")
-                    
-                    # Create TTS task
-                    self.tts_task = asyncio.create_task(self.synthesize_speech_pyttsx3(text))
+                    logging.info(f"🔊 Starting TTS: {text[:50]}...")
                     
                     try:
-                        await self.tts_task
-                        print("✅ TTS completed")
+                        # Run with timeout
+                        await asyncio.wait_for(
+                            self.synthesize_speech_streaming(text),
+                            timeout=30.0
+                        )
+                        logging.info("✅ TTS completed")
+                    except asyncio.TimeoutError:
+                        logging.warning("⌛ TTS timed out")
                     except asyncio.CancelledError:
-                        print("❌ TTS task was cancelled")
+                        logging.info("❌ TTS cancelled")
                     except Exception as e:
-                        print(f"❌ TTS task error: {e}")
+                        logging.error(f"❌ TTS error: {e}")
                     finally:
-                        self.tts_task = None
+                        self.is_speaking = False
                 
                 await asyncio.sleep(0.05)
                 
             except Exception as e:
-                print(f"❌ TTS loop error: {e}")
+                logging.error(f"❌ TTS loop error: {e}")
+                self.is_speaking = False
                 await asyncio.sleep(1)
 
-    async def synthesize_speech_pyttsx3(self, text):
-        """TTS with proper interruption support"""
+    async def synthesize_speech_streaming(self, text):
+        """Stream TTS from ElevenLabs"""
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json"
+        }
+        data = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",  # Important for Hindi/English
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75,
+                "style": 0.0,
+                "use_speaker_boost": True
+            }
+        }
+        
         try:
-            if self.tts_engine and not self.user_interrupted:
+            async with self.tts_lock:
                 self.is_speaking = True
-                print(f"🎵 Speaking: {text}")
                 
-                def speak():
-                    try:
-                        if not self.user_interrupted:
-                            self.tts_engine.say(text)
-                            self.tts_engine.runAndWait()
-                    except Exception as e:
-                        print(f"❌ TTS speak error: {e}")
-                
-                await asyncio.to_thread(speak)
-            
+                # Use aiohttp for async HTTP requests
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, headers=headers, json=data) as response:
+                        if response.status == 200:
+                            audio_stream = BytesIO()
+                            async for chunk in response.content.iter_any():
+                                if self.user_interrupted:
+                                    raise asyncio.CancelledError("User interrupted TTS")
+                                audio_stream.write(chunk)
+                            
+                            audio_stream.seek(0)
+                            
+                            # Play the audio
+                            try:
+                                sound = pygame.mixer.Sound(audio_stream)
+                                sound.play()
+                                
+                                # Wait for playback to finish or interruption
+                                start_time = time.time()
+                                while pygame.mixer.get_busy() and not self.user_interrupted:
+                                    if time.time() - start_time > 30:  # Max 30 seconds per TTS
+                                        break
+                                    await asyncio.sleep(0.1)
+                                
+                                # Stop if interrupted
+                                if self.user_interrupted:
+                                    sound.stop()
+                                
+                            except pygame.error as e:
+                                logging.error(f"❌ Pygame sound error: {e}")
+                                # Fallback to music player
+                                audio_stream.seek(0)
+                                pygame.mixer.music.load(audio_stream)
+                                pygame.mixer.music.play()
+                                while pygame.mixer.music.get_busy() and not self.user_interrupted:
+                                    await asyncio.sleep(0.1)
+                                if self.user_interrupted:
+                                    pygame.mixer.music.stop()
+                        else:
+                            error_text = await response.text()
+                            logging.error(f"❌ ElevenLabs error: {response.status} - {error_text}")
+        except asyncio.CancelledError:
+            logging.info("TTS interrupted by user")
+            raise
         except Exception as e:
-            print(f"❌ TTS synthesis error: {e}")
+            logging.error(f"❌ TTS synthesis error: {e}")
+            raise
         finally:
             self.is_speaking = False
 
     async def start_streaming(self):
         """Start the voice assistant"""
-        print("🟢 Voice Assistant Ready")
-        print("🎤 Speak naturally - I'll respond in Hinglish!")
-        print("💬 Real-time conversation - interrupt anytime!")
-        print("🔄 Starting all services...")
+        logging.info("🟢 Voice Assistant Ready")
+        logging.info("🎤 Speak naturally - I'll respond in Hinglish!")
+        logging.info("💬 Real-time conversation - interrupt anytime!")
+        logging.info("🔄 Starting all services...")
         
         try:
-            with sd.InputStream(
+            # Start audio stream
+            stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
                 callback=self.audio_callback,
                 blocksize=FRAME_SIZE,
                 dtype=np.float32
-            ):
-                print("✅ Audio stream started")
+            )
+            with stream:
+                logging.info("✅ Audio stream started")
                 
                 # Start all services
                 tasks = [
                     asyncio.create_task(self.stream_deepgram_transcription()),
                     asyncio.create_task(self.stream_llm_response()),
-                    asyncio.create_task(self.stream_tts_audio())
+                    asyncio.create_task(self.stream_tts_audio()),
                 ]
                 
-                print("✅ All services started - Ready for conversation!")
-                print("🎯 Try speaking, then interrupt mid-response to test real-time!")
+                logging.info("✅ All services started - Ready for conversation!")
+                logging.info("🎯 Try speaking, then interrupt mid-response to test real-time!")
                 
                 # Wait for all tasks
                 await asyncio.gather(*tasks, return_exceptions=True)
                 
         except Exception as e:
-            print(f"❌ Stream error: {e}")
+            logging.error(f"❌ Stream error: {e}")
             self.connection_active = False
 
 async def main():
-    assistant = FreeTTSVoiceAssistant(tts_method="pyttsx3")
+    assistant = FreeTTSVoiceAssistant()
     try:
         await assistant.start_streaming()
     except KeyboardInterrupt:
-        print("\n👋 Goodbye!")
+        logging.info("\n🛑 Shutting down gracefully...")
         assistant.connection_active = False
+        
+        # Cancel all running tasks
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        [task.cancel() for task in tasks]
+        
+        # Wait for tasks to cancel
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        logging.info("👋 Goodbye!")
     except Exception as e:
-        print(f"❌ Main error: {e}")
+        logging.error(f"❌ Main error: {e}")
         traceback.print_exc()
+    finally:
+        # Ensure pygame is properly quit
+        pygame.mixer.quit()
+        logging.info("✅ Pygame mixer quit")
 
 if __name__ == "__main__":
     asyncio.run(main())
