@@ -175,7 +175,8 @@ class FreeTTSVoiceAssistant:
         """Check if the TTS voice is available"""
         try:
             voices = edge_tts.list_voices()
-            target_voice = "hi-IN-MadhurNeural"  # or "hi-IN-SwaraNeural"
+            # target_voice = "hi-IN-MadhurNeural"  # or "hi-IN-SwaraNeural"
+            target_voice = "hi-IN-SwaraNeural"  # or "hi-IN-SwaraNeural"
             if not any(v['ShortName'] == target_voice for v in voices):
                 logging.warning(f"⚠️ Voice {target_voice} not found. Using first available English voice")
                 en_voices = [v for v in voices if 'en-' in v['Locale'].lower()]
