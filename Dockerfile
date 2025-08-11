@@ -4,12 +4,14 @@ FROM --platform=linux/amd64 python:3.10-slim
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    SDL_AUDIODRIVER=alsa
 
 # Install OS dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libasound2-dev \
+    alsa-utils \
     portaudio19-dev \
     libffi-dev \
     libsndfile1 \
@@ -29,8 +31,8 @@ RUN pip install --upgrade pip && pip install -r requirementFinal.txt
 # Copy your application code
 COPY . .
 
-# Expose port for FastAPI if needed
+# Expose port for FastAPI (if needed)
 EXPOSE 8000
 
-# Default command — change 'main.py' to your actual entry point if different
+# Default command — change 'main.py' to your actual entry point
 CMD ["python", "edgetts.py"]
