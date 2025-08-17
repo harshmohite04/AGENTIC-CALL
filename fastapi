@@ -1,0 +1,51 @@
+from fastapi import FastAPI, BackgroundTasks, UploadFile, Form
+import os
+import asyncio
+import sys
+from dotenv import load_dotenv
+
+from agentic import async_main
+
+app = FastAPI()
+
+# Load API keys from .env
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+
+if not GROQ_API_KEY or not DEEPGRAM_API_KEY:
+    print("❌ ERROR: Missing GROQ_API_KEY or DEEPGRAM_API_KEY in environment.")
+    sys.exit(1)
+
+
+@app.get("/")
+def check():
+    return {"message": "Hello World"}
+
+
+@app.post("/start-voice")
+async def start_voice(
+    background_tasks: BackgroundTasks,
+    file: UploadFile,   # PDF file
+    index_path: str = Form("faiss_index")  # extra form field
+):
+    """Endpoint to trigger Voice RAG Assistant"""
+
+    # Save uploaded file locally
+    pdf_path = f"uploads/{file.filename}"
+    os.makedirs("uploads", exist_ok=True)
+
+    with open(pdf_path, "wb") as f:
+        f.write(await file.read())
+
+    # Run voice assistant in background
+    async def runner():
+        await async_main(pdf_path, GROQ_API_KEY, DEEPGRAM_API_KEY, index_path)
+
+    background_tasks.add_task(lambda: asyncio.run(runner()))
+
+    return {
+        "status": "Voice assistant started",
+        "pdf": pdf_path,
+        "index": index_path
+    }
