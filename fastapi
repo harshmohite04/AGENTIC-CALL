@@ -12,7 +12,7 @@ app = FastAPI()
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 if not GROQ_API_KEY or not DEEPGRAM_API_KEY:
     print("❌ ERROR: Missing GROQ_API_KEY or DEEPGRAM_API_KEY in environment.")
     sys.exit(1)
@@ -27,7 +27,7 @@ def check():
 async def start_voice(
     background_tasks: BackgroundTasks,
     file: UploadFile,   # PDF file
-    index_path: str = Form("faiss_index")  # extra form field
+    index_path: str = Form("faiss_index") 
 ):
     """Endpoint to trigger Voice RAG Assistant"""
 
@@ -40,7 +40,7 @@ async def start_voice(
 
     # Run voice assistant in background
     async def runner():
-        await async_main(pdf_path, GROQ_API_KEY, DEEPGRAM_API_KEY, index_path)
+        await async_main(pdf_path, GROQ_API_KEY, DEEPGRAM_API_KEY, ELEVENLABS_API_KEY, index_path)
 
     background_tasks.add_task(lambda: asyncio.run(runner()))
 
